@@ -12,7 +12,9 @@ import time
 
 from . import ql2_pb2 as p
 
-__all__ = ['connect', 'set_loop_type', 'Connection', 'Cursor']
+__all__ = ['connect', 'set_loop_type', 'Connection', 'Cursor', 'DEFAULT_PORT']
+
+DEFAULT_PORT = 28015
 
 pErrorType = p.Response.ErrorType
 pResponse = p.Response.ResponseType
@@ -25,12 +27,7 @@ from .handshake import *
 try:
     from ssl import match_hostname, CertificateError
 except ImportError:
-    from backports.ssl_match_hostname import match_hostname, CertificateError
-
-try:
-    xrange
-except NameError:
-    xrange = range
+    from .backports.ssl_match_hostname import match_hostname, CertificateError
 
 try:
     {}.iteritems
@@ -143,6 +140,12 @@ class Cursor(object):
 
         self._maybe_fetch_batch()
         self._extend_internal(first_response)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
 
     def close(self):
         if self.error is None:
@@ -271,13 +274,23 @@ class SocketWrapper(object):
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
             if len(self.ssl) > 0:
-                ssl_context = self._get_ssl_context(self.ssl["ca_certs"])
                 try:
-                    self._socket = ssl_context.wrap_socket(self._socket,
-                                                           server_hostname=self.host)
+                    if hasattr(ssl, 'SSLContext'): # Python2.7 and 3.2+, or backports.ssl
+                        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                        if hasattr(ssl_context, "options"):
+                            ssl_context.options |= getattr(ssl, "OP_NO_SSLv2", 0)
+                            ssl_context.options |= getattr(ssl, "OP_NO_SSLv3", 0)
+                        ssl_context.verify_mode = ssl.CERT_REQUIRED
+                        ssl_context.check_hostname = True # redundant with match_hostname
+                        ssl_context.load_verify_locations(self.ssl["ca_certs"])
+                        self._socket = ssl_context.wrap_socket(self._socket, server_hostname=self.host)
+                    else: # this does not disable SSLv2 or SSLv3
+                        self._socket = ssl.wrap_socket(
+                            self._socket, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_SSLv23,
+                            ca_certs=self.ssl["ca_certs"])
                 except IOError as exc:
                     self._socket.close()
-                    raise ReqlDriverError("SSL handshake failed: %s" % (str(exc),))
+                    raise ReqlDriverError("SSL handshake failed (see server log for more information): %s" % str(exc))
                 try:
                     match_hostname(self._socket.getpeercert(), hostname=self.host)
                 except CertificateError:
@@ -294,17 +307,15 @@ class SocketWrapper(object):
                 # an optimization, then need to read each separately
                 if request is not "":
                     self.sendall(request)
-
-                response = b""
+                
+                # The response from the server is a null-terminated string
+                response = b''
                 while True:
                     char = self.recvall(1, deadline)
                     if char == b'\0':
                         break
                     response += char
-        except ReqlAuthError:
-            self.close()
-            raise
-        except ReqlTimeoutError:
+        except (ReqlAuthError, ReqlTimeoutError):
             self.close()
             raise
         except ReqlDriverError as ex:
@@ -319,7 +330,7 @@ class SocketWrapper(object):
         except Exception as ex:
             self.close()
             raise ReqlDriverError("Could not connect to %s:%s. Error: %s" %
-                                  (self.host, self.port, ex))
+                                  (self.host, self.port, str(ex)))
 
     def is_open(self):
         return self._socket is not None
@@ -395,18 +406,6 @@ class SocketWrapper(object):
                 self.close()
                 raise
 
-    def _get_ssl_context(self, ca_certs):
-        ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-        if hasattr(ctx, "options"):
-            ctx.options |= getattr(ssl, "OP_NO_SSLv2", 0)
-            ctx.options |= getattr(ssl, "OP_NO_SSLv3", 0)
-
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = True
-        ctx.load_verify_locations(ca_certs)
-        return ctx
-
-
 class ConnectionInstance(object):
     def __init__(self, parent):
         self._parent = parent
@@ -430,7 +429,7 @@ class ConnectionInstance(object):
     def is_open(self):
         return self._socket.is_open()
 
-    def close(self, noreply_wait, token):
+    def close(self, noreply_wait=False, token=None):
         self._closing = True
 
         # Cursors may remove themselves when errored, so copy a list of them
@@ -503,7 +502,7 @@ class ConnectionInstance(object):
                     self._parent._get_json_decoder(query))
             elif not self._closing:
                 # This response is corrupted or not intended for us
-                self.close(False, None)
+                self.close()
                 raise ReqlDriverError("Unexpected response received.")
 
 
@@ -643,17 +642,20 @@ class DefaultConnection(Connection):
 
 connection_type = DefaultConnection
 
-def connect(
-        host='localhost',
-        port=28015,
-        db=None,
-        auth_key=None,
-        user='admin',
-        password=None,
-        timeout=20,
-        ssl=dict(),
-        _handshake_version=10,
-        **kwargs):
+def connect(host=None, port=None, db=None, auth_key=None, user=None, password=None, timeout=20, ssl=None, _handshake_version=10, **kwargs):
+    if host is None:
+        host = 'localhost'
+    if port is None:
+        port = DEFAULT_PORT
+    if user is None:
+        user = 'admin'
+    if timeout is None:
+        timeout = 20
+    if ssl is None:
+        ssl = dict()
+    if _handshake_version is None:
+        _handshake_version = 10
+    
     conn = connection_type(host, port, db, auth_key, user, password, timeout, ssl, _handshake_version, **kwargs)
     return conn.reconnect(timeout=timeout)
 

@@ -19,7 +19,7 @@ namespace ql {
 // The minimum amount of stack space we require to be available on a coroutine
 // before attempting to compile or evaluate a term.
 const size_t MIN_COMPILE_STACK_SPACE = 16 * KILOBYTE;
-const size_t MIN_EVAL_STACK_SPACE = 16 * KILOBYTE;
+const size_t MIN_EVAL_STACK_SPACE = 32 * KILOBYTE;
 
 counted_t<const term_t> compile_on_current_stack(
         compile_env_t *env,
@@ -218,8 +218,8 @@ counted_t<const term_t> compile_term(compile_env_t *env, const raw_term_t &t) {
         }, MIN_COMPILE_STACK_SPACE);
 }
 
-runtime_term_t::runtime_term_t(backtrace_id_t bt)
-    : bt_rcheckable_t(bt) { }
+runtime_term_t::runtime_term_t(backtrace_id_t _bt)
+    : bt_rcheckable_t(_bt) { }
 
 runtime_term_t::~runtime_term_t() { }
 

@@ -1109,7 +1109,10 @@ class TcpConnection extends Connection
                         j = i+1
                         status_str = status_buf.toString()
                         # Get the reply from the server, and parse it as JSON
-                        server_reply = JSON.parse(status_str)
+                        try
+                            server_reply = JSON.parse(status_str)
+                        catch json_error
+                            throw new err.ReqlDriverError(status_str)
 
                         if state is 1
                             if not server_reply.success
@@ -1139,7 +1142,7 @@ class TcpConnection extends Connection
                             auth_salt = new Buffer(authentication.s, 'base64')
                             auth_i = parseInt(authentication.i)
 
-                            if not auth_r.substr(0, r_string) == r_string
+                            if not (auth_r.substr(0, r_string.length) == r_string)
                                 throw new err.ReqlAuthError("Invalid nonce from server")
 
                             client_final_message_without_proof = "c=biws,r=" + auth_r
@@ -1662,3 +1665,8 @@ module.exports.connect = varar 0, 2, (hostOrCallback, callback) ->
                 resolve(result)
         create_connection(host, wrappedCb)
     ).nodeify callback
+
+# Exposing the connection classes
+module.exports.Connection = Connection
+module.exports.HttpConnection = HttpConnection
+module.exports.TcpConnection = TcpConnection

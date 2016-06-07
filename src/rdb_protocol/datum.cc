@@ -223,6 +223,7 @@ void datum_t::data_wrapper_t::destruct() {
     } break;
     default: unreachable();
     }
+    internal_type = internal_type_t::UNINITIALIZED;
 }
 
 void datum_t::data_wrapper_t::assign_copy(const datum_t::data_wrapper_t &copyee) {
@@ -288,6 +289,10 @@ void datum_t::data_wrapper_t::assign_move(datum_t::data_wrapper_t &&movee) noexc
     } break;
     default: unreachable();
     }
+#ifndef NDEBUG
+    // De-initialize `movee` to make it easier to catch use-after-move bugs
+    movee.destruct();
+#endif
 }
 
 datum_t::datum_t() : data() { }
@@ -463,31 +468,35 @@ datum_t to_datum(const rapidjson::Value &json, const configured_limits_t &limits
         return datum_t::boolean(true);
     } break;
     case rapidjson::kObjectType: {
-        datum_object_builder_t builder;
-        for (rapidjson::Value::ConstMemberIterator it = json.MemberBegin();
-             it != json.MemberEnd();
-             ++it) {
-            fail_if_invalid(it->name.GetString(),
-                            it->name.GetStringLength());
-            datum_string_t key(it->name.GetStringLength(),
-                               it->name.GetString());
-            bool dup = builder.add(key, to_datum(it->value, limits, reql_version));
-            rcheck_datum(!dup, base_exc_t::LOGIC,
-                         strprintf("Duplicate key %s in JSON.",
-                                   datum_t(key).print().c_str()));
-        }
-        const std::set<std::string> pts = { pseudo::literal_string };
-        return std::move(builder).to_datum(pts);
+        return call_with_enough_stack<datum_t>([&]() {
+            datum_object_builder_t builder;
+            for (rapidjson::Value::ConstMemberIterator it = json.MemberBegin();
+                 it != json.MemberEnd();
+                 ++it) {
+                fail_if_invalid(it->name.GetString(),
+                                it->name.GetStringLength());
+                datum_string_t key(it->name.GetStringLength(),
+                                   it->name.GetString());
+                bool dup = builder.add(key, to_datum(it->value, limits, reql_version));
+                rcheck_datum(!dup, base_exc_t::LOGIC,
+                             strprintf("Duplicate key %s in JSON.",
+                                       datum_t(key).print().c_str()));
+            }
+            const std::set<std::string> pts = { pseudo::literal_string };
+            return std::move(builder).to_datum(pts);
+        }, MIN_DATUM_RECURSION_STACK_SPACE);
     } break;
     case rapidjson::kArrayType: {
-        datum_array_builder_t builder(limits);
-        builder.reserve(json.Size());
-        for (rapidjson::Value::ConstValueIterator it = json.Begin();
-             it != json.End();
-             ++it) {
-            builder.add(to_datum(*it, limits, reql_version));
-        }
-        return std::move(builder).to_datum();
+        return call_with_enough_stack<datum_t>([&]() {
+            datum_array_builder_t builder(limits);
+            builder.reserve(json.Size());
+            for (rapidjson::Value::ConstValueIterator it = json.Begin();
+                 it != json.End();
+                 ++it) {
+                builder.add(to_datum(*it, limits, reql_version));
+            }
+            return std::move(builder).to_datum();
+        }, MIN_DATUM_RECURSION_STACK_SPACE);
     } break;
     case rapidjson::kStringType: {
         fail_if_invalid(json.GetString(), json.GetStringLength());
@@ -1133,7 +1142,7 @@ std::string datum_t::compose_secondary(
     }
 
     const std::string truncated_secondary_key =
-        secondary_key.substr(0, trunc_size(skey_version, primary_key_string.length()));
+        secondary_key.substr(0, trunc_size(primary_key_string.length()));
 
     return mangle_secondary(
         skey_version, truncated_secondary_key, primary_key_string, tag_string);
@@ -1269,7 +1278,7 @@ std::string datum_t::extract_truncated_secondary(
     const std::string &secondary_and_primary) {
     components_t components = parse_secondary(secondary_and_primary);
     std::string skey = std::move(components.secondary);
-    size_t mts = max_trunc_size(components.skey_version);
+    size_t mts = max_trunc_size();
     if (skey.length() >= mts) {
         skey.erase(mts);
     }
@@ -1328,7 +1337,7 @@ store_key_t datum_t::truncated_secondary(
     s.push_back('\0');
 
     // Truncate the key if necessary
-    size_t mts = max_trunc_size(skey_version);
+    size_t mts = max_trunc_size();
     if (s.length() >= mts) {
         s.erase(mts);
     }
@@ -1479,11 +1488,11 @@ datum_t datum_t::get_field(const datum_string_t &key, throw_bool_t throw_bool) c
     while (range_beg < range_end) {
         const size_t center = range_beg + ((range_end - range_beg) / 2);
         auto center_pair = unchecked_get_pair(center);
-        const int cmp = key.compare(center_pair.first);
-        if (cmp == 0) {
+        const int cmp_res = key.compare(center_pair.first);
+        if (cmp_res == 0) {
             // Found it
             return center_pair.second;
-        } else if (cmp < 0) {
+        } else if (cmp_res < 0) {
             range_end = center;
         } else {
             range_beg = center + 1;
@@ -1936,18 +1945,17 @@ datum_t to_datum(cJSON *json, const configured_limits_t &limits,
     }
 }
 
-size_t datum_t::max_trunc_size(skey_version_t skey_version) {
-    return trunc_size(skey_version, rdb_protocol::MAX_PRIMARY_KEY_SIZE);
+size_t datum_t::max_trunc_size() {
+    return trunc_size(rdb_protocol::MAX_PRIMARY_KEY_SIZE);
 }
 
-size_t datum_t::trunc_size(skey_version_t skey_version, size_t primary_key_size) {
+size_t datum_t::trunc_size(size_t primary_key_size) {
     // We subtract three bytes because of the NULL byte we pad on the end of the
     // primary key and the two 1-byte offsets at the end of the key (which are
     // used to extract the primary key and tag num).
     size_t terminated_primary_key_size = primary_key_size;
 
     // Since 1.16, we're adding a null byte to the end of the secondary index key.
-    guarantee(skey_version == skey_version_t::post_1_16);
     terminated_primary_key_size += 1;
 
     return MAX_KEY_SIZE - terminated_primary_key_size - tag_size - 2;

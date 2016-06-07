@@ -377,10 +377,9 @@ region_t monokey_region(const store_key_t &k) {
 
 key_range_t sindex_key_range(const store_key_t &start,
                              const store_key_t &end,
-                             key_range_t::bound_t end_type,
-                             ql::skey_version_t skey_version) {
+                             key_range_t::bound_t end_type) {
 
-    const size_t max_trunc_size = ql::datum_t::max_trunc_size(skey_version);
+    const size_t max_trunc_size = ql::datum_t::max_trunc_size();
 
     // If `end` is not truncated and right bound is open, we don't increment the right
     // bound.
@@ -444,7 +443,7 @@ struct rdb_r_get_region_visitor : public boost::static_visitor<region_t> {
     }
 
     region_t operator()(const changefeed_subscribe_t &s) const {
-        return s.region;
+        return s.shard_region;
     }
 
     region_t operator()(const changefeed_limit_subscribe_t &s) const {
@@ -501,7 +500,7 @@ struct rdb_r_shard_visitor_t : public boost::static_visitor<bool> {
         if (!region_is_empty(intersection)) {
             T tmp = arg;
             tmp.region = intersection;
-            *payload_out = tmp;
+            *payload_out = std::move(tmp);
             return true;
         } else {
             return false;
@@ -509,7 +508,10 @@ struct rdb_r_shard_visitor_t : public boost::static_visitor<bool> {
     }
 
     bool operator()(const changefeed_subscribe_t &s) const {
-        return rangey_read(s);
+        changefeed_subscribe_t tmp = s;
+        tmp.shard_region = region;
+        *payload_out = std::move(tmp);
+        return true;
     }
 
     bool operator()(const changefeed_limit_subscribe_t &s) const {
@@ -1148,7 +1150,7 @@ struct rdb_w_get_region_visitor : public boost::static_visitor<region_t> {
     }
 
     region_t operator()(const changefeed_subscribe_t &s) const {
-        return s.region;
+        return s.shard_region;
     }
 
     region_t operator()(const changefeed_limit_subscribe_t &s) const {
@@ -1504,7 +1506,7 @@ RDB_IMPL_SERIALIZABLE_9_FOR_CLUSTER(
 RDB_IMPL_SERIALIZABLE_3_FOR_CLUSTER(
         distribution_read_t, max_depth, result_limit, region);
 
-RDB_IMPL_SERIALIZABLE_2_FOR_CLUSTER(changefeed_subscribe_t, addr, region);
+RDB_IMPL_SERIALIZABLE_2_FOR_CLUSTER(changefeed_subscribe_t, addr, shard_region);
 RDB_IMPL_SERIALIZABLE_8_FOR_CLUSTER(
     changefeed_limit_subscribe_t,
     addr,

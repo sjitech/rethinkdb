@@ -436,9 +436,9 @@ RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(distribution_read_t);
 struct changefeed_subscribe_t {
     changefeed_subscribe_t() { }
     explicit changefeed_subscribe_t(ql::changefeed::client_t::addr_t _addr)
-        : addr(_addr), region(region_t::universe()) { }
+        : addr(_addr), shard_region(region_t::universe()) { }
     ql::changefeed::client_t::addr_t addr;
-    region_t region;
+    region_t shard_region;
 };
 RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(changefeed_subscribe_t);
 
@@ -707,11 +707,11 @@ struct write_t {
      *  durability. */
     template<class T>
     write_t(T &&t,
-            durability_requirement_t durability,
+            durability_requirement_t _durability,
             profile_bool_t _profile,
             const ql::configured_limits_t &_limits)
         : write(std::forward<T>(t)),
-          durability_requirement(durability), profile(_profile),
+          durability_requirement(_durability), profile(_profile),
           limits(_limits) { }
     template<class T>
     write_t(T &&t, profile_bool_t _profile,
@@ -735,8 +735,7 @@ region_t monokey_region(const store_key_t &k);
 // TODO consider relocating this
 key_range_t sindex_key_range(const store_key_t &start,
                              const store_key_t &end,
-                             key_range_t::bound_t end_type,
-                             ql::skey_version_t skey_version);
+                             key_range_t::bound_t end_type);
 }  // namespace rdb_protocol
 
 

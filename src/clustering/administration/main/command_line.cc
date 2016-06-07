@@ -60,6 +60,10 @@
 #define RETHINKDB_RESTORE_SCRIPT "rethinkdb-restore"
 #define RETHINKDB_INDEX_REBUILD_SCRIPT "rethinkdb-index-rebuild"
 
+namespace cluster_defaults {
+const int reconnect_timeout = (24 * 60 * 60);    // 24 hours (in secs)
+}  // namespace cluster_defaults
+
 MUST_USE bool numwrite(const char *path, int number) {
     // Try to figure out what this function does.
     FILE *fp1 = fopen(path, "w");
@@ -443,6 +447,28 @@ boost::optional<int> parse_join_delay_secs_option(
     }
 }
 
+boost::optional<int> parse_node_reconnect_timeout_secs_option(
+        const std::map<std::string, options::values_t> &opts) {
+    if (exists_option(opts, "--cluster-reconnect-timeout")) {
+        const std::string timeout_opt = get_single_option(opts, "--cluster-reconnect-timeout");
+        uint64_t node_reconnect_timeout_secs;
+        if (!strtou64_strict(timeout_opt, 10, &node_reconnect_timeout_secs)) {
+            throw std::runtime_error(strprintf(
+                    "ERROR: cluster-reconnect-timeout should be a number, got '%s'",
+                    timeout_opt.c_str()));
+        }
+        if (node_reconnect_timeout_secs > std::numeric_limits<int>::max() ||
+            node_reconnect_timeout_secs * 1000 > std::numeric_limits<int>::max()) {
+            throw std::runtime_error(strprintf(
+                "ERROR: cluster-reconnect-timeout is too large. Must be at most %d",
+                std::numeric_limits<int>::max() / 1000));
+        }
+        return boost::optional<int>(static_cast<int>(node_reconnect_timeout_secs));
+    }
+
+    return boost::optional<int>();
+}
+
 /* An empty outer `boost::optional` means the `--cache-size` parameter is not present. An
 empty inner `boost::optional` means the cache size is set to `auto`. */
 boost::optional<boost::optional<uint64_t> > parse_total_cache_size_option(
@@ -803,7 +829,9 @@ public:
     }
 
     ~fp_wrapper_t() {
-        fclose(fp);
+        if (fp != nullptr) {
+            fclose(fp);
+        }
     }
 
     FILE *get() {
@@ -824,11 +852,25 @@ bool initialize_tls_ctx(
         return false;
     }
 
-    // Only allow TLS v1.2, prefer server ciphers, and always generate new keys
-    // for DHE or ECDHE.
-    SSL_CTX_set_options(
-        tls_ctx_out->get(),
-        SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1);
+    boost::optional<std::string> min_protocol_opt = get_optional_option(
+        opts, "--tls-min-protocol");
+    long protocol_flags = // NOLINT(runtime/int)
+        SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1;
+    if (min_protocol_opt) {
+        if (*min_protocol_opt == "TLSv1") {
+            protocol_flags ^= SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1;
+        } else if (*min_protocol_opt == "TLSv1.1") {
+            protocol_flags ^= SSL_OP_NO_TLSv1_1;
+        } else if (*min_protocol_opt == "TLSv1.2") {
+            // Already the default
+        } else {
+            logERR("Unrecognized TLS protocol version '%s'.", min_protocol_opt->c_str());
+            return false;
+        }
+    }
+    SSL_CTX_set_options(tls_ctx_out->get(), protocol_flags);
+
+    // Prefer server ciphers, and always generate new keys for DHE or ECDHE.
     SSL_CTX_set_options(
         tls_ctx_out->get(),
         SSL_OP_CIPHER_SERVER_PREFERENCE|SSL_OP_SINGLE_DH_USE|SSL_OP_SINGLE_ECDH_USE);
@@ -848,7 +890,7 @@ bool initialize_tls_ctx(
     and newer (1.0.2) versions seem to be okay with 'EECDH' though. */
     std::string ciphers = ciphers_opt ? *ciphers_opt : "EECDH+AESGCM";
     if (0 == SSL_CTX_set_cipher_list(tls_ctx_out->get(), ciphers.c_str())) {
-        logNTC("No secure cipher suites available\n");
+        logERR("No secure cipher suites available.\n");
         return false;
     }
 
@@ -873,13 +915,13 @@ bool initialize_tls_ctx(
 
     int curve_nid = OBJ_txt2nid(curve_name.c_str());
     if (NID_undef == curve_nid) {
-        logNTC("No elliptic curve found corresponding to name: %s", curve_name.c_str());
+        logERR("No elliptic curve found corresponding to name '%s'.", curve_name.c_str());
         return false;
     }
 
     EC_KEY *ec_key = EC_KEY_new_by_curve_name(curve_nid);
     if (nullptr == ec_key) {
-        logNTC("Unable to get Elliptic Curve by name: %s", curve_name.c_str());
+        logERR("Unable to get elliptic curve by name '%s'.", curve_name.c_str());
         return false;
     }
 
@@ -912,7 +954,7 @@ bool initialize_tls_ctx(
         fp_wrapper_t dhparams_fp(dhparams_filename->c_str(), "r");
         if (nullptr == dhparams_fp.get()) {
             logERR(
-                "unable to open %s for reading: %s",
+                "Unable to open '%s' for reading: %s",
                 dhparams_filename->c_str(),
                 errno_string(get_errno()).c_str());
             return false;
@@ -921,17 +963,23 @@ bool initialize_tls_ctx(
         DH *dhparams = PEM_read_DHparams(
             dhparams_fp.get(), nullptr, nullptr, nullptr);
         if (nullptr == dhparams) {
+            unsigned long err_code = ERR_get_error(); // NOLINT(runtime/int)
+            const char *err_str = ERR_reason_error_string(err_code);
             logERR(
-                "unable to read DH parameters from %s: %s",
+                "Unable to read DH parameters from '%s': %s (OpenSSL error %lu)",
                 dhparams_filename->c_str(),
-                ERR_error_string(ERR_get_error(), nullptr));
+                err_str == nullptr ? "unknown error" : err_str,
+                err_code);
             return false;
         }
 
         if (1 != SSL_CTX_set_tmp_dh(tls_ctx_out->get(), dhparams)) {
+            unsigned long err_code = ERR_get_error(); // NOLINT(runtime/int)
+            const char *err_str = ERR_reason_error_string(err_code);
             logERR(
-                "unable to set DH parameters: %s",
-                ERR_error_string(ERR_get_error(), nullptr));
+                "Unable to set DH parameters: %s (OpenSSL error %lu)",
+                err_str == nullptr ? "unknown error" : err_str,
+                err_code);
             return false;
         }
     }
@@ -1517,13 +1565,13 @@ options::help_section_t get_network_options(const bool join_required, std::vecto
     options_out->push_back(options::option_t(options::names_t("--cluster-port"),
                                              options::OPTIONAL,
                                              strprintf("%d", port_defaults::peer_port)));
-    help.add("--cluster-port port", "port for receiving connections from other nodes");
+    help.add("--cluster-port port", "port for receiving connections from other servers");
 
     options_out->push_back(options::option_t(options::names_t("--client-port"),
                                              options::OPTIONAL,
                                              strprintf("%d", port_defaults::client_port)));
 #ifndef NDEBUG
-    help.add("--client-port port", "port to use when connecting to other nodes (for development)");
+    help.add("--client-port port", "port to use when connecting to other servers (for development)");
 #endif  // NDEBUG
 
     options_out->push_back(options::option_t(options::names_t("--driver-port"),
@@ -1538,7 +1586,7 @@ options::help_section_t get_network_options(const bool join_required, std::vecto
 
     options_out->push_back(options::option_t(options::names_t("--join", "-j"),
                                              join_required ? options::MANDATORY_REPEAT : options::OPTIONAL_REPEAT));
-    help.add("-j [ --join ] host[:port]", "host and port of a rethinkdb node to connect to");
+    help.add("-j [ --join ] host[:port]", "host and port of a rethinkdb server to connect to");
 
     options_out->push_back(options::option_t(options::names_t("--reql-http-proxy"),
                                              options::OPTIONAL));
@@ -1551,7 +1599,15 @@ options::help_section_t get_network_options(const bool join_required, std::vecto
     options_out->push_back(options::option_t(options::names_t("--join-delay"),
                                              options::OPTIONAL));
     help.add("--join-delay seconds", "hold the TCP connection open for these many "
-             "seconds before joining with another server.");
+             "seconds before joining with another server");
+
+    options_out->push_back(options::option_t(options::names_t("--cluster-reconnect-timeout"),
+                                             options::OPTIONAL,
+                                             strprintf("%d", cluster_defaults::reconnect_timeout)));
+    help.add("--cluster-reconnect-timeout seconds", "maximum number of seconds to "
+                                                    "attempt reconnecting to a server "
+                                                    "before giving up, the default is "
+                                                    "24 hours");
 
     return help;
 }
@@ -1648,13 +1704,19 @@ options::help_section_t get_tls_options(std::vector<options::option_t> *options_
         "--cluster-tls-ca ca_filename",
         "CA certificate bundle used to verify cluster peer certificates");
 
-    // Generic TLS options, for customizing cipher suites.
+    // Generic TLS options, for customizing the supported protocols and cipher suites.
+    options_out->push_back(options::option_t(options::names_t("--tls-min-protocol"),
+                                             options::OPTIONAL));
     options_out->push_back(options::option_t(options::names_t("--tls-ciphers"),
                                              options::OPTIONAL));
     options_out->push_back(options::option_t(options::names_t("--tls-ecdh-curve"),
                                              options::OPTIONAL));
     options_out->push_back(options::option_t(options::names_t("--tls-dhparams"),
                                              options::OPTIONAL));
+    help.add(
+        "--tls-min-protocol protocol",
+        "the minimum TLS protocol version that the server accepts; options are "
+        "'TLSv1', 'TLSv1.1', 'TLSv1.2'; default is 'TLSv1.2'");
     help.add(
         "--tls-ciphers cipher_list",
         "specify a list of TLS ciphers to use; default is 'EECDH+AESGCM'");
@@ -1663,7 +1725,8 @@ options::help_section_t get_tls_options(std::vector<options::option_t> *options_
         "specify a named elliptic curve to use for ECDHE; default is 'prime256v1'");
     help.add(
         "--tls-dhparams dhparams_filename",
-        "provide parameters for DHE key agreement; REQUIRED if using DHE cipher suites; at least 2048-bit recommended");
+        "provide parameters for DHE key agreement; REQUIRED if using DHE cipher suites; "
+        "at least 2048-bit recommended");
 
     return help;
 }
@@ -1980,6 +2043,8 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
             parse_total_cache_size_option(opts);
 
         boost::optional<int> join_delay_secs = parse_join_delay_secs_option(opts);
+        boost::optional<int> node_reconnect_timeout_secs =
+            parse_node_reconnect_timeout_secs_option(opts);
 
         // Open and lock the directory, but do not create it
         bool is_new_directory = false;
@@ -2019,6 +2084,9 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
                                 get_optional_option(opts, "--config-file"),
                                 std::vector<std::string>(argv, argv + argc),
                                 join_delay_secs ? join_delay_secs.get() : 0,
+                                node_reconnect_timeout_secs
+                                    ? node_reconnect_timeout_secs.get()
+                                    : cluster_defaults::reconnect_timeout,
                                 tls_configs);
 
         const file_direct_io_mode_t direct_io_mode = parse_direct_io_mode_option(opts);
@@ -2077,6 +2145,8 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
         }
 
         boost::optional<int> join_delay_secs = parse_join_delay_secs_option(opts);
+        boost::optional<int> node_reconnect_timeout_secs =
+            parse_node_reconnect_timeout_secs_option(opts);
 
 #ifndef _WIN32
         get_and_set_user_group(opts);
@@ -2117,6 +2187,9 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
                                 get_optional_option(opts, "--config-file"),
                                 std::vector<std::string>(argv, argv + argc),
                                 join_delay_secs ? join_delay_secs.get() : 0,
+                                node_reconnect_timeout_secs
+                                    ? node_reconnect_timeout_secs.get()
+                                    : cluster_defaults::reconnect_timeout,
                                 tls_configs);
 
         bool result;
@@ -2234,6 +2307,8 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
         update_check_t do_update_checking = parse_update_checking_option(opts);
 
         boost::optional<int> join_delay_secs = parse_join_delay_secs_option(opts);
+        boost::optional<int> node_reconnect_timeout_secs =
+            parse_node_reconnect_timeout_secs_option(opts);
 
         // Attempt to create the directory early so that the log file can use it.
         // If we create the file, it will be cleaned up unless directory_initialized()
@@ -2298,6 +2373,9 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
                                 get_optional_option(opts, "--config-file"),
                                 std::vector<std::string>(argv, argv + argc),
                                 join_delay_secs ? join_delay_secs.get() : 0,
+                                node_reconnect_timeout_secs
+                                    ? node_reconnect_timeout_secs.get()
+                                    : cluster_defaults::reconnect_timeout,
                                 tls_configs);
 
         const file_direct_io_mode_t direct_io_mode = parse_direct_io_mode_option(opts);
@@ -2339,7 +2417,7 @@ void help_rethinkdb_porcelain() {
     }
 
     printf("Running 'rethinkdb' will create a new data directory or use an existing one,\n");
-    printf("  and serve as a RethinkDB cluster node.\n");
+    printf("  and serve as a RethinkDB server.\n");
     printf("%s", format_help(help_sections).c_str());
     printf("\n");
     printf("There are a number of subcommands for more specific tasks:\n");
@@ -2363,7 +2441,7 @@ void help_rethinkdb_create() {
     }
 
     printf("'rethinkdb create' is used to prepare a directory to act"
-                " as the storage location for a RethinkDB cluster node.\n");
+                " as the storage location for a RethinkDB server.\n");
     printf("%s", format_help(help_sections).c_str());
 }
 
@@ -2374,7 +2452,7 @@ void help_rethinkdb_serve() {
         get_rethinkdb_serve_options(&help_sections, &options);
     }
 
-    printf("'rethinkdb serve' is the actual process for a RethinkDB cluster node.\n");
+    printf("'rethinkdb serve' is the actual process for a RethinkDB server.\n");
     printf("%s", format_help(help_sections).c_str());
 }
 
