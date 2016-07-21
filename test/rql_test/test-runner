@@ -7,7 +7,7 @@ from __future__ import print_function
 import atexit, collections, copy, datetime, distutils.version, distutils.spawn, itertools, json, optparse, os
 import re, resource, shutil, signal, stat, string, subprocess, sys, tempfile, threading, time, traceback, warnings
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "common"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "../common"))
 import driver, parsePolyglot, test_exceptions, utils, http_support
 
 try:
@@ -1477,12 +1477,13 @@ def getTestList(rootPath, allowedLanguages, testFilters=None, shards=0):
                         testLanguages = [x for x in interpreters[lang] if x in allowedLanguages] or None
                         if single and testLanguages:
                             testLanguages = [testLanguages[0]]
+                        testLanguages = set(testLanguages or [])
                 langSetsCache[testLangExtensions] = testLanguages
             
             elif extension in ('mocha', 'yaml'):
                 testLanguages = langSetsCache[extension]
             else:
-                testLanguages = [None]
+                testLanguages = set([None])
             
             # -- create tests for all language versions that pass the filters
             
@@ -1542,7 +1543,7 @@ class WorkerThread(threading.Thread):
         
         if not os.path.isdir(scratchDir):
             raise ValueError('scratchDir must be an existing directory, got: %s' % scratchDir)
-        self.scratchDir = scratchDir
+        self.scratchDir = os.path.realpath(scratchDir)
         
         if externalServer is not None:
             if not isinstance(externalServer, ExternalServer):

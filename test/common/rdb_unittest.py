@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # Copyright 2015-2016 RethinkDB, all rights reserved.
 
-import itertools, os, random, re, shutil, sys, unittest, warnings
+import itertools, os, random, re, shutil, sys, traceback, unittest, warnings
 
 import driver, utils
 
@@ -9,7 +9,76 @@ def main():
     runner = unittest.TextTestRunner(verbosity=2)
     unittest.main(argv=[sys.argv[0]], testRunner=runner)
 
-class RdbTestCase(unittest.TestCase):
+class TestCaseCompatible(unittest.TestCase):
+    '''Replace missing bits from various versions of Python'''
+    
+    def __init__(self, *args, **kwargs):
+        super(TestCaseCompatible, self).__init__(*args, **kwargs)
+        if not hasattr(self, 'assertIsNone'):
+            self.assertIsNone = self.replacement_assertIsNone
+        if not hasattr(self, 'assertIsNotNone'):
+            self.assertIsNotNone = self.replacement_assertIsNotNone
+        if not hasattr(self, 'assertGreater'):
+            self.assertGreater = self.replacement_assertGreater
+        if not hasattr(self, 'assertGreaterEqual'):
+            self.assertGreaterEqual = self.replacement_assertGreaterEqual
+        if not hasattr(self, 'assertLess'):
+            self.assertLess = self.replacement_assertLess
+        if not hasattr(self, 'assertLessEqual'):
+            self.assertLessEqual = self.replacement_assertLessEqual
+        if not hasattr(self, 'assertIn'):
+            self.assertIn = self.replacement_assertIn
+        if not hasattr(self, 'assertRaisesRegexp'):
+            self.assertRaisesRegexp = self.replacement_assertRaisesRegexp
+        
+        if not hasattr(self, 'skipTest'):
+            self.skipTest = self.replacement_skipTest
+        
+    def replacement_assertIsNone(self, val):
+        if val is not None:
+            raise AssertionError('%s is not None' % val)
+    
+    def replacement_assertIsNotNone(self, val):
+        if val is None:
+            raise AssertionError('%s is None' % val)
+    
+    def replacement_assertGreater(self, actual, expected):
+        if not actual > expected:
+            raise AssertionError('%s not greater than %s' % (actual, expected))
+    
+    def replacement_assertGreaterEqual(self, actual, expected):
+        if not actual >= expected:
+            raise AssertionError('%s not greater than or equal to %s' % (actual, expected))
+    
+    def replacement_assertLess(self, actual, expected):
+        if not actual < expected:
+            raise AssertionError('%s not less than %s' % (actual, expected))
+    
+    def replacement_assertLessEqual(self, actual, expected):
+        if not actual <= expected:
+            raise AssertionError('%s not less than or equal to %s' % (actual, expected))
+    
+    def replacement_assertIsNotNone(self, val):
+        if val is None:
+            raise AssertionError('Result is None')
+    
+    def replacement_assertIn(self, val, iterable):
+        if not val in iterable:
+            raise AssertionError('%s is not in %s' % (val, iterable))
+    
+    def replacement_assertRaisesRegexp(self, exception, regexp, callable_func, *args, **kwds):
+        try:
+            callable_func(*args, **kwds)
+        except Exception as e:
+            self.assertTrue(isinstance(e, exception), '%s expected to raise %s but instead raised %s: %s\n%s' % (repr(callable_func), repr(exception), e.__class__.__name__, str(e), traceback.format_exc()))
+            self.assertTrue(re.search(regexp, str(e)), '%s did not raise the expected message "%s", but rather: %s' % (repr(callable_func), str(regexp), str(e)))
+        else:
+            self.fail('%s failed to raise a %s' % (repr(callable_func), repr(exception)))
+    
+    def replacement_skipTest(self, message):
+        sys.stderr.write("%s " % message)
+
+class RdbTestCase(TestCaseCompatible):
     
     # -- settings
     
