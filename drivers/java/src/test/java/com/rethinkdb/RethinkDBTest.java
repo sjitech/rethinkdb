@@ -769,7 +769,7 @@ public class RethinkDBTest{
     }
 
     @Test
-    public void test() throws Exception {
+    public void test_ChangeFeeds_Cursor_Close() throws Exception {
         Field f_cursorCache = Connection.class.getDeclaredField("cursorCache");
         f_cursorCache.setAccessible(true);
 
