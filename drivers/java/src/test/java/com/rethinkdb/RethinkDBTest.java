@@ -16,6 +16,7 @@ import java.beans.BeanInfo;
 import java.beans.Introspector;
 import java.beans.PropertyDescriptor;
 import java.lang.reflect.Array;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -55,6 +56,7 @@ public class RethinkDBTest{
     public static void oneTimeTearDown() throws Exception {
         Connection conn = TestingFramework.createConnection();
         try {
+            r.db(dbName).tableDrop(tableName).run(conn);
             r.dbDrop(dbName).run(conn);
         } catch(ReqlError e){}
         conn.close();
@@ -695,7 +697,7 @@ public class RethinkDBTest{
                 waiter.resume();
             }).start();
 
-        waiter.await(5000, total);
+        waiter.await(2500, total);
 
         assertEquals(total, writeCounter.get());
     }
@@ -764,6 +766,25 @@ public class RethinkDBTest{
     @Test
     public void testNoreply() throws Exception {
         r.expr(null).runNoReply(conn);
+    }
+
+    @Test
+    public void test() throws Exception {
+        Field f_cursorCache = Connection.class.getDeclaredField("cursorCache");
+        f_cursorCache.setAccessible(true);
+
+        Map<Long, Cursor> cursorCache = (Map<Long, Cursor>) f_cursorCache.get(conn);
+        assertEquals(0, cursorCache.size());
+
+        Cursor c = r.db(dbName).table(tableName).changes().run(conn);
+
+        try {
+            c.next(1000);
+        } catch (TimeoutException ex) {
+        }
+        c.close();
+
+        assertEquals(0, cursorCache.size());
     }
 }
 
