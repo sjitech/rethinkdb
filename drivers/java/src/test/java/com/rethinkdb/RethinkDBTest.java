@@ -760,5 +760,10 @@ public class RethinkDBTest{
             e = e;
         }
     }
+
+    @Test
+    public void testNoreply() throws Exception {
+        r.expr(null).runNoReply(conn);
+    }
 }
 
