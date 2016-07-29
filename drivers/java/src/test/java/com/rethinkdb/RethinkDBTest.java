@@ -17,7 +17,6 @@ import java.beans.Introspector;
 import java.beans.PropertyDescriptor;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.TimeoutException;
@@ -218,16 +217,7 @@ public class RethinkDBTest{
         try {
             r.dbCreate("test").run(conn);
         } catch (Exception e) {}
-        try{
-            r.db("test").tableDrop(tblName).run(conn);
-        } catch (Exception e) {}
 
-        try {
-            r.dbDrop("optargs").run(conn);
-        } catch (Exception e) {}
-        try {
-            r.dbDrop("conn_default").run(conn);
-        } catch (Exception e) {}
         r.expr(r.array("optargs", "conn_default")).forEach(r::dbCreate).run(conn);
         r.expr(r.array("test", "optargs", "conn_default")).forEach(dbName ->
                         r.db(dbName).tableCreate(tblName).do_((unused) ->
@@ -769,7 +759,7 @@ public class RethinkDBTest{
     }
 
     @Test
-    public void test_ChangeFeeds_Cursor_Close() throws Exception {
+    public void test_Changefeeds_Cursor_Close_cause_new_cursor_cause_memory_leak() throws Exception {
         Field f_cursorCache = Connection.class.getDeclaredField("cursorCache");
         f_cursorCache.setAccessible(true);
 
